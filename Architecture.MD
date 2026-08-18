@@ -62,6 +62,48 @@ Three integrations, all initiated from the backend:
 
 The user authenticates through React against FastAPI, which validates credentials against Cloud SQL and issues a JWT. The user selects a project; the backend enumerates its resources through Cloud Asset Inventory and fetches cost recommendations through the Recommender API, streaming progress to the frontend over the WebSocket at each stage. Both datasets go to Vertex AI Gemini, which returns a structured analysis. The result is persisted to Cloud SQL and rendered in the React report view — cost breakdown, prioritised recommendations, and `gcloud` commands the user can copy and run.
 
+## Deployment options
+
+The diagram above is **Path A**, the managed topology. A second path self-hosts the data layer in an existing GKE cluster. The application code, request flow, schema, and API surface are identical — only where Postgres and the backend run differs.
+
+| | **Path A — Managed** | **Path B — Self-hosted** |
+|---|---|---|
+| Database | Cloud SQL for PostgreSQL | Postgres StatefulSet in GKE |
+| Backend | Cloud Run | Deployment in GKE |
+| Auth to GCP | Service account | Workload Identity — no key files |
+| Backups, PITR, SLA | Managed by Google | None, by design |
+| Retention | Unbounded | 15 days, CronJob-enforced |
+| Monthly cost | ~$10–20 | ~$4–10 |
+| Build with | `prompts/03-cloudsql-postgres-websocket.md` | `prompts/03-alt-postgres-gke-websocket.md` |
+
+Path B's storage layer:
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│  GKE cluster — namespace: cost-detective                      │
+│                                                               │
+│  ┌─────────────┐        ┌──────────────────────────────────┐  │
+│  │ backend     │───────►│ postgres  StatefulSet + 10Gi PVC │  │
+│  │ Deployment  │  5432  │ ClusterIP — no external exposure │  │
+│  │ (Workload   │        └──────────────▲───────────────────┘  │
+│  │  Identity)  │                       │                      │
+│  └──────┬──────┘        ┌──────────────┴───────────────────┐  │
+│         │               │ retention  CronJob, daily         │  │
+│         │               │ DELETE WHERE created_at < 15d     │  │
+│         │               └──────────────────────────────────┘  │
+│         │      NetworkPolicy: only backend may reach :5432    │
+└─────────┼─────────────────────────────────────────────────────┘
+          │ ADC via Workload Identity
+          ▼
+   gcloud CLI · Recommender API · Vertex AI Gemini
+```
+
+**Why a database pod is defensible here.** The usual objection to running databases in Kubernetes concerns durability of irreplaceable data. It does not apply to this table: every row is the output of a scan that can be re-run in minutes against live infrastructure, which is the real source of truth. Losing the volume costs a re-scan, not a business record. The 15-day retention is what makes that true, so the retention policy and the pod are a package — one without the other is a mistake.
+
+**Workload Identity removes key files from the design.** On Path B the backend pod gets ADC by binding its Kubernetes service account to a Google service account, so nothing needs a downloaded JSON key — for either the `gcloud` calls or Vertex AI. That is a security improvement over Path A, not only a cost one.
+
+See [`COSTS.md`](COSTS.md) for the full comparison.
+
 ## Design notes
 
 **A single credential.** The backend needs Application Default Credentials to shell out to `gcloud`. Vertex AI accepts those same credentials, so the entire stack authenticates with one service account and no external API keys. Nothing needs to go into a secrets manager except the database password and the JWT signing secret.
